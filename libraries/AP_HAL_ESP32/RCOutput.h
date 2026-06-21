@@ -26,6 +26,7 @@
 
 #include "driver/gpio.h"
 #include "driver/mcpwm_prelude.h"
+#include "RCOutput_dshot.h"
 
 namespace ESP32
 {
@@ -100,6 +101,22 @@ public:
 
 
 private:
+    // ========== DShot Support ==========
+    dshot_chan _dshot_chans[12];
+    dshot_encoder_cache _dshot_encoders;
+
+    // DShot private methods
+    void dshot_init_channel(uint8_t chan, dshot_mode_t mode);
+    void dshot_shutdown_channel(uint8_t chan);
+    void dshot_send_channel(uint8_t chan, uint16_t throttle);
+    uint16_t dshot_build_frame(uint16_t throttle, bool telem_request);
+    uint16_t dshot_calculate_crc(uint16_t data);
+    bool dshot_is_frame_interval_elapsed(uint8_t chan);
+    void dshot_record_transmission_time(uint8_t chan);
+    bool dshot_init_encoder(dshot_mode_t mode);
+    void dshot_cleanup_encoders();
+
+    // ========== PWM Support (Original) ==========
 
     struct pwm_group {
         // SDK objects for the group
