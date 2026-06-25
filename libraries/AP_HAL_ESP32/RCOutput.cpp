@@ -356,21 +356,21 @@ void RCOutput::set_output_mode(uint32_t mask, const enum output_mode mode)
     // Check if this is a DShot mode
     if (AP_HAL::RCOutput::is_dshot_protocol(mode)) {
         // map AP_HAL::RCOutput::output_mode (MODE_PWM_DSHOT150=5..MODE_PWM_DSHOT1200=8)
-        // to our own dshot_mode_t (DSHOT150=1..DSHOT1200=4); the two enums do not
+        // to our own Dshot_Mode enum (MODE_150=1..MODE_1200=4); the two enums do not
         // share numeric values so this can't be a plain cast.
-        dshot_mode_t dshot_mode;
+        Dshot_Mode dshot_mode;
         switch (mode) {
         case MODE_PWM_DSHOT150:
-            dshot_mode = DSHOT150;
+            dshot_mode = Dshot_Mode::MODE_150;
             break;
         case MODE_PWM_DSHOT300:
-            dshot_mode = DSHOT300;
+            dshot_mode = Dshot_Mode::MODE_300;
             break;
         case MODE_PWM_DSHOT600:
-            dshot_mode = DSHOT600;
+            dshot_mode = Dshot_Mode::MODE_600;
             break;
         case MODE_PWM_DSHOT1200:
-            dshot_mode = DSHOT1200;
+            dshot_mode = Dshot_Mode::MODE_1200;
             break;
         default:
             return;
@@ -532,8 +532,11 @@ void RCOutput::write_int(uint8_t chan, uint16_t period_us)
         period_us = safe_pwm[chan];
     }
 
-    // Check if this is a DShot channel
-    if (_dshot_chans[chan].tx_channel != nullptr) {
+    // Check if this channel was configured for DShot by set_output_mode().
+    // Use is_dshot (set at the start of dshot_init_channel) rather than
+    // tx_channel != nullptr so that a failed RMT init does not silently fall
+    // back to driving MCPWM PWM on a channel the user configured as DShot.
+    if (_dshot_chans[chan].is_dshot) {
         // DShot mode: convert PWM microseconds to throttle value
         // PWM: 1000-2000us → throttle: 48-2047
         // Special case: period_us=0 → motor stop command
@@ -690,10 +693,10 @@ void RCOutput::set_failsafe_pwm(uint32_t chmask, uint16_t period_us)
 
 // RMT bytes encoder: preconfigured for DShot bit timings
 // This encoder is created once per DShot speed and reused across channels
-static rmt_bytes_encoder_config_t get_dshot_encoder_config(dshot_mode_t mode)
+static rmt_bytes_encoder_config_t get_dshot_encoder_config(Dshot_Mode mode)
 {
     // Pre-calculate timing in RMT ticks for the given DShot mode
-    const dshot_timing_us &timing = DSHOT_TIMING[mode];
+    const Dshot_Timing_Us &timing = DSHOT_TIMING[static_cast<int>(mode)];
     const uint16_t bit_length_ticks = (uint16_t)(timing.bit_length_us * RMT_TICKS_PER_US);
     const uint16_t t1h_ticks = (uint16_t)(timing.t1h_length_us * RMT_TICKS_PER_US);
     const uint16_t t0h_ticks = t1h_ticks / 2;  // 0-bit high time is half of 1-bit
@@ -719,14 +722,37 @@ static rmt_bytes_encoder_config_t get_dshot_encoder_config(dshot_mode_t mode)
 /*
  * Initialize RMT TX channel and encoder for a specific DShot channel
  */
-void RCOutput::dshot_init_channel(uint8_t chan, dshot_mode_t mode)
+void RCOutput::dshot_init_channel(uint8_t chan, Dshot_Mode mode)
 {
-    if (chan >= MAX_CHANNELS || mode < DSHOT150 || mode > DSHOT1200) {
+    if (chan >= MAX_CHANNELS || mode < Dshot_Mode::MODE_150 || mode > Dshot_Mode::MODE_1200) {
         return;
     }
 
-    dshot_chan &dchan = _dshot_chans[chan];
+    Dshot_Chan &dchan = _dshot_chans[chan];
     uint8_t gpio = pwm_chan_list[chan].gpio_num;
+
+    // Mark this channel as DShot before any hardware init so that write_int()
+    // does not silently fall back to MCPWM if the RMT channel fails to open.
+    dchan.is_dshot = true;
+
+    // Idempotency guard: set_output_mode() can be called multiple times during
+    // ArduPilot's init sequence.  Re-creating an already-open RMT channel
+    // would leak the old handle and exhaust the TX channel pool.
+    if (dchan.tx_channel != nullptr) {
+        return;
+    }
+
+    // Fully disconnect MCPWM from this GPIO before RMT takes ownership.
+    // mcpwm_generator_set_force_level() stops the generator's PWM transitions
+    // but does NOT clear the GPIO-matrix route that MCPWM registered during
+    // init; on ESP32-S3 this leaves MCPWM still driving the pad in between
+    // RMT transmissions, producing an interfering signal.
+    // gpio_reset_pin() tears down the GPIO-matrix output route entirely so that
+    // rmt_new_tx_channel() is the sole owner of the pad afterwards.
+    mcpwm_generator_set_force_level(pwm_chan_list[chan].h_gen, 0, true);
+    gpio_reset_pin((gpio_num_t)gpio);
+    gpio_set_direction((gpio_num_t)gpio, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)gpio, 0);
 
     // Create RMT TX channel for this GPIO
     rmt_tx_channel_config_t tx_cfg = {
@@ -754,23 +780,26 @@ void RCOutput::dshot_init_channel(uint8_t chan, dshot_mode_t mode)
 
     // Initialize or reuse encoder for this mode
     if (!dshot_init_encoder(mode)) {
-        ESP_LOGE(TAG, "Failed to initialize DShot encoder for mode %d", mode);
+        ESP_LOGE(TAG, "Failed to initialize DShot encoder for mode %d", static_cast<int>(mode));
         rmt_disable((rmt_channel_handle_t)dchan.tx_channel);
         rmt_del_channel((rmt_channel_handle_t)dchan.tx_channel);
         dchan.tx_channel = nullptr;
         return;
     }
 
-    dchan.encoder = (void*)_dshot_encoders.encoder[mode];
+    dchan.encoder = (void*)_dshot_encoders.encoder[static_cast<int>(mode)];
     dchan.last_throttle = 0;
     dchan.last_tx_time_us = 0;
 
     // Calculate minimum frame interval in microseconds
     // Frame = 16 bits, each bit takes bit_length_us, plus padding
-    const dshot_timing_us &timing = DSHOT_TIMING[mode];
-    dchan.min_frame_interval_us = (uint64_t)(timing.bit_length_us * 16) + 20;  // +20us padding
+    const Dshot_Timing_Us &timing = DSHOT_TIMING[static_cast<int>(mode)];
+    // Require at least one full frame period of idle between transmissions so
+    // ESC decoders can reliably find frame boundaries.  Double the frame
+    // duration gives ~100µs idle for DShot150 which is well within spec.
+    dchan.min_frame_interval_us = (uint64_t)(timing.bit_length_us * 16 * 2);
 
-    ESP_LOGI(TAG, "DShot%d initialized on GPIO %d", 150 * (1 << (mode-1)), gpio);
+    ESP_LOGI(TAG, "DShot%d initialized on GPIO %d", 150 * (1 << (static_cast<int>(mode)-1)), gpio);
 }
 
 /*
@@ -782,7 +811,7 @@ void RCOutput::dshot_send_channel(uint8_t chan, uint16_t throttle)
         return;
     }
 
-    dshot_chan &dchan = _dshot_chans[chan];
+    Dshot_Chan &dchan = _dshot_chans[chan];
     if (dchan.tx_channel == nullptr) {
         return;  // Channel not configured for DShot
     }
@@ -798,12 +827,20 @@ void RCOutput::dshot_send_channel(uint8_t chan, uint16_t throttle)
     // Byte-swap for RMT transmission (MSB first per byte)
     uint16_t frame_swapped = __builtin_bswap16(frame);
 
-    // Transmit via RMT
-    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+    // Transmit via RMT (non-blocking: if the previous frame is still in the
+    // hardware queue, skip this call rather than blocking the caller task).
+    // With portMAX_DELAY (the default), rmt_transmit() would stall until the
+    // previous frame finishes and then immediately queue the next one, leaving
+    // no idle gap between frames and preventing DShot decoders from finding
+    // frame boundaries.
+    rmt_transmit_config_t tx_cfg = {};
+    tx_cfg.loop_count = 0;
+    tx_cfg.flags.queue_nonblocking = 1;
     if (rmt_transmit((rmt_channel_handle_t)dchan.tx_channel,
                      (rmt_encoder_handle_t)dchan.encoder,
                      &frame_swapped, sizeof(frame_swapped), &tx_cfg) != ESP_OK) {
-        ESP_LOGW(TAG, "DShot transmission failed on channel %d", chan);
+        // Queue full or other transient error — skip this frame; the next
+        // push() call (≥1ms away) will succeed once the hardware is idle.
         return;
     }
 
@@ -849,7 +886,7 @@ bool RCOutput::dshot_is_frame_interval_elapsed(uint8_t chan)
         return false;
     }
 
-    dshot_chan &dchan = _dshot_chans[chan];
+    Dshot_Chan &dchan = _dshot_chans[chan];
     uint64_t now_us = esp_timer_get_time();
     uint64_t elapsed = now_us - dchan.last_tx_time_us;
 
@@ -871,26 +908,26 @@ void RCOutput::dshot_record_transmission_time(uint8_t chan)
 /*
  * Initialize or reuse an RMT encoder for a specific DShot mode
  */
-bool RCOutput::dshot_init_encoder(dshot_mode_t mode)
+bool RCOutput::dshot_init_encoder(Dshot_Mode mode)
 {
-    if (mode < DSHOT150 || mode > DSHOT1200) {
+    if (mode < Dshot_Mode::MODE_150 || mode > Dshot_Mode::MODE_1200) {
         return false;
     }
 
     // Check if encoder already exists for this mode
-    if (_dshot_encoders.encoder[mode] != nullptr) {
-        _dshot_encoders.ref_count[mode]++;
+    if (_dshot_encoders.encoder[static_cast<int>(mode)] != nullptr) {
+        _dshot_encoders.ref_count[static_cast<int>(mode)]++;
         return true;
     }
 
     // Create new encoder
     rmt_bytes_encoder_config_t encoder_cfg = get_dshot_encoder_config(mode);
-    if (rmt_new_bytes_encoder(&encoder_cfg, (rmt_encoder_handle_t*)&_dshot_encoders.encoder[mode]) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create RMT bytes encoder for DShot mode %d", mode);
+    if (rmt_new_bytes_encoder(&encoder_cfg, (rmt_encoder_handle_t*)&_dshot_encoders.encoder[static_cast<int>(mode)]) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create RMT bytes encoder for DShot mode %d", static_cast<int>(mode));
         return false;
     }
 
-    _dshot_encoders.ref_count[mode] = 1;
+    _dshot_encoders.ref_count[static_cast<int>(mode)] = 1;
     return true;
 }
 
@@ -899,7 +936,7 @@ bool RCOutput::dshot_init_encoder(dshot_mode_t mode)
  */
 void RCOutput::dshot_cleanup_encoders()
 {
-    for (int i = DSHOT150; i <= DSHOT1200; i++) {
+    for (int i = static_cast<int>(Dshot_Mode::MODE_150); i <= static_cast<int>(Dshot_Mode::MODE_1200); i++) {
         if (_dshot_encoders.encoder[i] != nullptr) {
             rmt_del_encoder((rmt_encoder_handle_t)_dshot_encoders.encoder[i]);
             _dshot_encoders.encoder[i] = nullptr;
@@ -917,10 +954,13 @@ void RCOutput::dshot_shutdown_channel(uint8_t chan)
         return;
     }
 
-    dshot_chan &dchan = _dshot_chans[chan];
+    Dshot_Chan &dchan = _dshot_chans[chan];
     if (dchan.tx_channel != nullptr) {
         rmt_disable((rmt_channel_handle_t)dchan.tx_channel);
         rmt_del_channel((rmt_channel_handle_t)dchan.tx_channel);
         dchan.tx_channel = nullptr;
     }
+    dchan.is_dshot = false;
+    // Restore MCPWM generator to normal PWM mode
+    mcpwm_generator_set_force_level(pwm_chan_list[chan].h_gen, -1, true);
 }

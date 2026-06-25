@@ -41,17 +41,25 @@ static constexpr uint16_t DSHOT_CRC_MASK = 0x0F;
 static constexpr uint16_t DSHOT_FULL_PACKET = 0xFFFF;
 
 // Bit timing (microseconds) for each DShot mode
-struct dshot_timing_us {
+struct Dshot_Timing_Us {
     double bit_length_us;   // Total bit period
     double t1h_length_us;   // High time for '1' bit
 };
 
-static constexpr dshot_timing_us DSHOT_TIMING[] = {
-    {0.0,   0.0},      // DSHOT_OFF (unused)
-    {6.67,  5.00},     // DSHOT150
-    {3.33,  2.50},     // DSHOT300
-    {1.67,  1.25},     // DSHOT600
-    {0.83,  0.67},     // DSHOT1200
+enum class Dshot_Mode : uint8_t {
+    OFF = 0,
+    MODE_150,
+    MODE_300,
+    MODE_600,
+    MODE_1200,
+};
+
+static constexpr Dshot_Timing_Us DSHOT_TIMING[] = {
+    {0.0,   0.0},      // OFF (unused)
+    {6.67,  5.00},     // MODE_150
+    {3.33,  2.50},     // MODE_300
+    {1.67,  1.25},     // MODE_600
+    {0.83,  0.67},     // MODE_1200
 };
 
 // ============================================================================
@@ -60,32 +68,29 @@ static constexpr dshot_timing_us DSHOT_TIMING[] = {
 
 static constexpr uint32_t DSHOT_RMT_RESOLUTION_HZ = 8000000;  // 8 MHz, 125 ns per tick
 static constexpr uint32_t RMT_TICKS_PER_US = DSHOT_RMT_RESOLUTION_HZ / 1000000;
-static constexpr uint16_t RMT_TX_BUFFER_SIZE = 64;  // Symbols per TX buffer
+// ESP32-S3 has 48 words of RMT memory per channel; using exactly 48 keeps
+// each channel in one memory block so all 4 TX channels remain available.
+// DShot only needs 16 symbols per frame so 48 is more than sufficient.
+static constexpr uint16_t RMT_TX_BUFFER_SIZE = 48;
 
 // ============================================================================
 // DShot Channel State Structure
 // ============================================================================
 
-struct dshot_chan {
+struct Dshot_Chan {
     void* tx_channel = nullptr;  // opaque rmt_channel_handle_t, real type only used in RCOutput.cpp
-    void* encoder = nullptr;     // opaque rmt_encoder_handle_t, shared by speed (see dshot_encoder_cache)
+    void* encoder = nullptr;     // opaque rmt_encoder_handle_t, shared by speed (see Dshot_Encoder_Cache)
 
+    bool is_dshot = false;                      // True once set_output_mode selects DShot for this channel,
+                                                // even if tx_channel is null due to a failed RMT init.
+                                                // Used to prevent silent PWM fallback on RMT failure.
     uint16_t last_throttle = 0;                 // Last throttle value sent
     uint64_t last_tx_time_us = 0;               // Time of last transmission
     uint64_t min_frame_interval_us = 0;         // Minimum time between frames
 };
 
-// DShot mode enumeration (matches AP_HAL::RCOutput output_mode)
-enum dshot_mode_t {
-    DSHOT_OFF = 0,
-    DSHOT150,
-    DSHOT300,
-    DSHOT600,
-    DSHOT1200,
-};
-
 // Encoder handle cache by speed (to avoid recreating encoders for each channel)
-struct dshot_encoder_cache {
-    void* encoder[5] = {};       // opaque rmt_encoder_handle_t; index 0 unused, 1-4 for DSHOT150-1200
+struct Dshot_Encoder_Cache {
+    void* encoder[5] = {};       // opaque rmt_encoder_handle_t; index 0 unused, 1-4 for MODE_150-MODE_1200
     uint32_t ref_count[5] = {};  // Reference count per speed
 };
